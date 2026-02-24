@@ -3,10 +3,15 @@ Analisador de Documentos Jurídicos - Script Principal
 
 Orquestra a extração de texto, reconhecimento de entidades,
 classificação e análise de prazos de documentos PDF jurídicos.
+Inclui módulos forenses de cruzamento, onerosidade e relatório.
 
 Uso:
     python main.py <caminho_pdf> [--output <diretorio_saida>]
     python main.py --todos                  # Analisa todos os PDFs no diretório
+    python main.py --forense --output output/   # Executa pipeline forense completo
+    python main.py --cruzamento --output output/ # Apenas cruzamento forense
+    python main.py --onerosidade --output output/ # Apenas análise de onerosidade
+    python main.py --relatorio --output output/   # Gera relatório DOCX consolidado
 """
 
 import argparse
@@ -181,6 +186,169 @@ def encontrar_pdfs(diretorio="."):
     return list(Path(diretorio).glob("*.pdf"))
 
 
+def encontrar_jsons_analise(diretorio):
+    """Encontra JSONs de análise existentes no diretório de saída."""
+    dir_saida = Path(diretorio)
+    jsons = sorted(dir_saida.glob("*_analise.json"))
+    return [str(j) for j in jsons]
+
+
+def executar_cruzamento(diretorio_saida):
+    """Executa o módulo de cruzamento forense."""
+    from src.cruzamento_forense import CruzamentoForense
+
+    jsons = encontrar_jsons_analise(diretorio_saida)
+    if len(jsons) < 2:
+        print("  ERRO: Necessário pelo menos 2 JSONs de análise para cruzamento.")
+        print(f"  Encontrados: {len(jsons)} em {diretorio_saida}/")
+        print("  Execute primeiro: python main.py --todos --output output/")
+        return None
+
+    print(f"\n{'='*60}")
+    print("  CRUZAMENTO FORENSE")
+    print(f"{'='*60}")
+    print(f"\n  Arquivos de entrada: {len(jsons)}")
+    for j in jsons:
+        print(f"    · {Path(j).name}")
+
+    cruzamento = CruzamentoForense(jsons)
+    resultado = cruzamento.executar()
+
+    # Resumo
+    entidades = resultado.get("entidades_comuns", {})
+    score = resultado.get("score_correlacao", {})
+    timeline = resultado.get("timeline_unificada", {})
+    padroes = resultado.get("padroes_suspeitos", {})
+
+    print(f"\n  Entidades comuns:")
+    print(f"    · CPFs: {entidades.get('cpf', {}).get('total_comuns', 0)}")
+    print(f"    · CNPJs: {entidades.get('cnpj', {}).get('total_comuns', 0)}")
+    print(f"    · Nº Processos: {entidades.get('numero_processo', {}).get('total_comuns', 0)}")
+
+    print(f"\n  Timeline unificada: {timeline.get('total_eventos', 0)} eventos")
+    periodo = timeline.get("periodo", {})
+    print(f"    · Período: {periodo.get('inicio', 'N/D')} a {periodo.get('fim', 'N/D')}")
+
+    print(f"\n  Padrões suspeitos:")
+    reacoes = padroes.get("reacoes_pos_decisao", {})
+    print(f"    · Reações pós-decisão (30 dias): {reacoes.get('correlacoes_encontradas', 0)}")
+    mov = padroes.get("movimentacoes_societarias", {})
+    print(f"    · Movimentações societárias coincidentes: {mov.get('coincidencias_90_dias', 0)}")
+    ativ = padroes.get("padroes_atividade", {}).get("executado", {})
+    print(f"    · Omissões do executado (>60d): {ativ.get('periodos_omissao_60d', 0)}")
+
+    print(f"\n  Score de correlação: {score.get('score', 0)}/100 ({score.get('classificacao', '')})")
+
+    # Salvar
+    caminho_json = Path(diretorio_saida) / "cruzamento_forense.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
+def executar_onerosidade(diretorio_saida):
+    """Executa o módulo de análise de onerosidade."""
+    from src.analise_onerosidade import AnaliseOnerosidade
+
+    jsons = encontrar_jsons_analise(diretorio_saida)
+    if not jsons:
+        print("  ERRO: Nenhum JSON de análise encontrado.")
+        print(f"  Execute primeiro: python main.py --todos --output output/")
+        return None
+
+    print(f"\n{'='*60}")
+    print("  ANÁLISE DE ONEROSIDADE")
+    print(f"{'='*60}")
+
+    analise = AnaliseOnerosidade(jsons)
+    resultado = analise.executar()
+
+    # Resumo
+    metricas = resultado.get("metricas_por_parte", {})
+    protelacao = resultado.get("indice_protelacao", {})
+    efetividade = resultado.get("indice_efetividade_exequente", {})
+    tempo_resp = resultado.get("tempo_resposta_executado", {})
+
+    print(f"\n  Métricas por parte:")
+    for parte, m in metricas.items():
+        if m.get("total_atos", 0) > 0:
+            print(f"    · {m['nome'][:40]}: {m['total_atos']} atos, "
+                  f"{m['peticoes']} petições, {m['recursos']} recursos")
+
+    print(f"\n  Índice de protelação (executado): "
+          f"{protelacao.get('indice', 0):.2%} ({protelacao.get('classificacao', '')})")
+    det = protelacao.get("detalhes", {})
+    print(f"    · Atos protelatórios: {det.get('atos_protelatarios', 0)}")
+    print(f"    · Certidões negativas: {det.get('certidoes_negativas', 0)}")
+
+    print(f"\n  Índice de efetividade (exequente): "
+          f"{efetividade.get('indice', 0):.2%} ({efetividade.get('classificacao', '')})")
+    det_e = efetividade.get("detalhes", {})
+    print(f"    · Tentativas: {det_e.get('total_tentativas_constricao', 0)}")
+    print(f"    · Exitosas: {det_e.get('constricoes_exitosas', 0)}")
+
+    if tempo_resp.get("tempo_medio_dias"):
+        print(f"\n  Tempo de resposta do executado:")
+        print(f"    · Média: {tempo_resp['tempo_medio_dias']} dias")
+        print(f"    · Mediana: {tempo_resp.get('mediana_dias', 'N/D')} dias")
+
+    # Salvar
+    caminho_json = Path(diretorio_saida) / "onerosidade.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
+def executar_relatorio(diretorio_saida, cruzamento=None, onerosidade=None):
+    """Gera relatório DOCX consolidado."""
+    from src.gerador_relatorio import GeradorRelatorioForense
+
+    # Carregar dados se não fornecidos
+    dir_saida = Path(diretorio_saida)
+
+    if cruzamento is None:
+        caminho_cruz = dir_saida / "cruzamento_forense.json"
+        if not caminho_cruz.exists():
+            print("  ERRO: cruzamento_forense.json não encontrado.")
+            print("  Execute primeiro: python main.py --cruzamento --output output/")
+            return None
+        with open(caminho_cruz, "r", encoding="utf-8") as f:
+            cruzamento = json.load(f)
+
+    if onerosidade is None:
+        caminho_oner = dir_saida / "onerosidade.json"
+        if not caminho_oner.exists():
+            print("  ERRO: onerosidade.json não encontrado.")
+            print("  Execute primeiro: python main.py --onerosidade --output output/")
+            return None
+        with open(caminho_oner, "r", encoding="utf-8") as f:
+            onerosidade = json.load(f)
+
+    print(f"\n{'='*60}")
+    print("  GERAÇÃO DE RELATÓRIO FORENSE")
+    print(f"{'='*60}")
+
+    gerador = GeradorRelatorioForense(cruzamento, onerosidade)
+    caminho_docx = dir_saida / "relatorio_forense.docx"
+    resultado = gerador.gerar(str(caminho_docx))
+
+    print(f"\n  Relatório gerado: {resultado}")
+    print(f"  Seções:")
+    print(f"    · Capa")
+    print(f"    · Identificação do caso")
+    print(f"    · 1. Resumo executivo")
+    print(f"    · 2. Timeline unificada")
+    print(f"    · 3. Análise de onerosidade")
+    print(f"    · 4. Correlações entre processos")
+    print(f"    · 5. Conclusões técnicas")
+
+    return resultado
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analisador de Documentos Jurídicos",
@@ -190,6 +358,10 @@ Exemplos:
   python main.py documento.pdf
   python main.py documento.pdf --output resultados/
   python main.py --todos --output resultados/
+  python main.py --cruzamento --output output/
+  python main.py --onerosidade --output output/
+  python main.py --relatorio --output output/
+  python main.py --forense --output output/
         """,
     )
     parser.add_argument(
@@ -207,10 +379,33 @@ Exemplos:
         default="output",
         help="Diretório de saída para os resultados (padrão: output/)",
     )
+    parser.add_argument(
+        "--cruzamento",
+        action="store_true",
+        help="Executar cruzamento forense nos JSONs existentes",
+    )
+    parser.add_argument(
+        "--onerosidade",
+        action="store_true",
+        help="Executar análise de onerosidade",
+    )
+    parser.add_argument(
+        "--relatorio",
+        action="store_true",
+        help="Gerar relatório DOCX consolidado",
+    )
+    parser.add_argument(
+        "--forense",
+        action="store_true",
+        help="Executar pipeline forense completo (cruzamento + onerosidade + relatório)",
+    )
 
     args = parser.parse_args()
 
-    if not args.arquivo and not args.todos:
+    modo_forense = args.cruzamento or args.onerosidade or args.relatorio or args.forense
+    modo_extracao = args.arquivo or args.todos
+
+    if not modo_forense and not modo_extracao:
         parser.print_help()
         sys.exit(1)
 
@@ -219,19 +414,40 @@ Exemplos:
     print(f"  Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print("=" * 60)
 
-    if args.todos:
-        pdfs = encontrar_pdfs()
-        if not pdfs:
-            print("Nenhum arquivo PDF encontrado no diretório atual.")
-            sys.exit(1)
-        print(f"\nEncontrados {len(pdfs)} arquivo(s) PDF.")
-        for pdf in pdfs:
-            analisar_pdf(str(pdf), args.output)
+    # Fase 1: Extração (se solicitada)
+    if modo_extracao:
+        if args.todos:
+            pdfs = encontrar_pdfs()
+            if not pdfs:
+                print("Nenhum arquivo PDF encontrado no diretório atual.")
+                sys.exit(1)
+            print(f"\nEncontrados {len(pdfs)} arquivo(s) PDF.")
+            for pdf in pdfs:
+                analisar_pdf(str(pdf), args.output)
+        else:
+            if not Path(args.arquivo).exists():
+                print(f"Erro: Arquivo não encontrado: {args.arquivo}")
+                sys.exit(1)
+            analisar_pdf(args.arquivo, args.output)
+
+    # Fase 2: Análise forense
+    if args.forense:
+        cruzamento = executar_cruzamento(args.output)
+        onerosidade = executar_onerosidade(args.output)
+        if cruzamento and onerosidade:
+            executar_relatorio(args.output, cruzamento, onerosidade)
     else:
-        if not Path(args.arquivo).exists():
-            print(f"Erro: Arquivo não encontrado: {args.arquivo}")
-            sys.exit(1)
-        analisar_pdf(args.arquivo, args.output)
+        cruzamento = None
+        onerosidade = None
+
+        if args.cruzamento:
+            cruzamento = executar_cruzamento(args.output)
+
+        if args.onerosidade:
+            onerosidade = executar_onerosidade(args.output)
+
+        if args.relatorio:
+            executar_relatorio(args.output, cruzamento, onerosidade)
 
     print(f"\n{'='*60}")
     print("  ANÁLISE CONCLUÍDA")
