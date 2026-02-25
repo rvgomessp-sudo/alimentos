@@ -4,7 +4,8 @@ Analisador de Documentos Jurídicos - Script Principal
 Orquestra a extração de texto, reconhecimento de entidades,
 classificação e análise de prazos de documentos PDF jurídicos.
 Inclui módulos forenses de cruzamento, onerosidade, relatório,
-mapeamento granular de movimentos e auditoria processual.
+mapeamento granular de movimentos, auditoria processual e
+segmentação de peças com identificação de autoria.
 
 Uso:
     python main.py <caminho_pdf> [--output <diretorio_saida>]
@@ -15,6 +16,7 @@ Uso:
     python main.py --relatorio --output output/   # Gera relatório DOCX consolidado
     python main.py --mapeamento --output output/  # Mapeamento granular SISBAJud/MLE
     python main.py --auditoria --output output/   # Auditoria de falhas e inconsistências
+    python main.py --segmentar --output output/   # Segmentação de peças processuais
 """
 
 import argparse
@@ -429,6 +431,48 @@ def executar_mapeamento(diretorio_saida):
     return resultado
 
 
+def executar_segmentacao(diretorio_saida):
+    """Executa segmentação de peças processuais com identificação de autoria."""
+    from src.segmentador_pecas import SegmentadorPecas
+
+    textos = encontrar_textos(diretorio_saida)
+
+    if not textos:
+        print("  ERRO: Nenhum arquivo de texto extraído encontrado.")
+        print("  Execute primeiro: python main.py --todos --output output/")
+        return None
+
+    print(f"\n{'='*60}")
+    print("  SEGMENTAÇÃO DE PEÇAS PROCESSUAIS")
+    print(f"{'='*60}")
+    print(f"\n  Textos de entrada: {len(textos)}")
+    for t in textos:
+        print(f"    · {Path(t).name}")
+
+    segmentador = SegmentadorPecas(textos)
+    resultado = segmentador.executar()
+
+    # Resumo consolidado
+    total_pecas = sum(
+        p["total_pecas"] for p in resultado["processos"].values()
+    )
+    print(f"\n  Total consolidado: {total_pecas} peças em {len(textos)} arquivo(s)")
+
+    # Salvar
+    # Remover conteúdo completo das peças para o JSON (muito grande)
+    resultado_json = json.loads(json.dumps(resultado, default=str))
+    for proc_data in resultado_json["processos"].values():
+        for peca in proc_data.get("pecas", []):
+            peca.pop("conteudo", None)
+
+    caminho_json = Path(diretorio_saida) / "segmentacao_pecas.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado_json, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
 def executar_auditoria(diretorio_saida, mapeamento=None):
     """Executa auditoria processual de falhas e inconsistências."""
     from src.auditoria_processual import AuditoriaProcessual
@@ -509,6 +553,7 @@ Exemplos:
   python main.py --relatorio --output output/
   python main.py --mapeamento --output output/
   python main.py --auditoria --output output/
+  python main.py --segmentar --output output/
   python main.py --forense --output output/
         """,
     )
@@ -553,15 +598,21 @@ Exemplos:
         help="Auditoria de falhas e inconsistências processuais",
     )
     parser.add_argument(
+        "--segmentar",
+        action="store_true",
+        help="Segmentação de peças processuais com identificação de autoria",
+    )
+    parser.add_argument(
         "--forense",
         action="store_true",
-        help="Pipeline forense completo (cruzamento + onerosidade + mapeamento + auditoria + relatório)",
+        help="Pipeline forense completo (segmentação + cruzamento + onerosidade + mapeamento + auditoria + relatório)",
     )
 
     args = parser.parse_args()
 
     modo_forense = (args.cruzamento or args.onerosidade or args.relatorio
-                    or args.mapeamento or args.auditoria or args.forense)
+                    or args.mapeamento or args.auditoria or args.segmentar
+                    or args.forense)
     modo_extracao = args.arquivo or args.todos
 
     if not modo_forense and not modo_extracao:
@@ -591,6 +642,7 @@ Exemplos:
 
     # Fase 2: Análise forense
     if args.forense:
+        executar_segmentacao(args.output)
         cruzamento = executar_cruzamento(args.output)
         onerosidade = executar_onerosidade(args.output)
         mapeamento = executar_mapeamento(args.output)
@@ -601,6 +653,9 @@ Exemplos:
         cruzamento = None
         onerosidade = None
         mapeamento = None
+
+        if args.segmentar:
+            executar_segmentacao(args.output)
 
         if args.cruzamento:
             cruzamento = executar_cruzamento(args.output)
