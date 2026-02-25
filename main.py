@@ -3,7 +3,9 @@ Analisador de Documentos Jurídicos - Script Principal
 
 Orquestra a extração de texto, reconhecimento de entidades,
 classificação e análise de prazos de documentos PDF jurídicos.
-Inclui módulos forenses de cruzamento, onerosidade e relatório.
+Inclui módulos forenses de cruzamento, onerosidade, relatório,
+mapeamento granular de movimentos, auditoria processual e
+segmentação de peças com identificação de autoria.
 
 Uso:
     python main.py <caminho_pdf> [--output <diretorio_saida>]
@@ -12,6 +14,9 @@ Uso:
     python main.py --cruzamento --output output/ # Apenas cruzamento forense
     python main.py --onerosidade --output output/ # Apenas análise de onerosidade
     python main.py --relatorio --output output/   # Gera relatório DOCX consolidado
+    python main.py --mapeamento --output output/  # Mapeamento granular SISBAJud/MLE
+    python main.py --auditoria --output output/   # Auditoria de falhas e inconsistências
+    python main.py --segmentar --output output/   # Segmentação de peças processuais
 """
 
 import argparse
@@ -349,6 +354,191 @@ def executar_relatorio(diretorio_saida, cruzamento=None, onerosidade=None):
     return resultado
 
 
+def encontrar_textos(diretorio):
+    """Encontra arquivos de texto extraídos no diretório de saída."""
+    dir_saida = Path(diretorio)
+    txts = sorted(dir_saida.glob("*_texto.txt"))
+    return [str(t) for t in txts]
+
+
+def executar_mapeamento(diretorio_saida):
+    """Executa mapeamento granular de movimentos processuais."""
+    from src.mapeamento_movimentos import MapeamentoMovimentos
+
+    textos = encontrar_textos(diretorio_saida)
+    jsons = encontrar_jsons_analise(diretorio_saida)
+
+    if not textos:
+        print("  ERRO: Nenhum arquivo de texto extraído encontrado.")
+        print("  Execute primeiro: python main.py --todos --output output/")
+        return None
+
+    print(f"\n{'='*60}")
+    print("  MAPEAMENTO GRANULAR DE MOVIMENTOS")
+    print(f"{'='*60}")
+    print(f"\n  Textos de entrada: {len(textos)}")
+    for t in textos:
+        print(f"    · {Path(t).name}")
+
+    mapeamento = MapeamentoMovimentos(textos, jsons)
+    resultado = mapeamento.executar()
+
+    # Resumo SISBAJud
+    sbj = resultado.get("sisbajud", {})
+    print(f"\n  SISBAJud:")
+    print(f"    · Eventos parseados: {sbj.get('total_eventos', 0)}")
+    print(f"    · Bloqueios: {sbj.get('total_bloqueios', 0)}")
+    print(f"    · Transferências: {sbj.get('total_transferencias', 0)}")
+    print(f"    · Protocolos únicos: {sbj.get('total_protocolos', 0)}")
+
+    valores = sbj.get("valores", {})
+    print(f"    · Maior valor solicitado: R$ {valores.get('maior_valor_solicitado', 0):,.2f}")
+    print(f"    · Total bloqueado: R$ {valores.get('total_efetivamente_bloqueado', 0):,.2f}")
+    print(f"    · Total transferido: R$ {valores.get('total_transferido', 0):,.2f}")
+    print(f"    · Taxa recuperação: {valores.get('taxa_recuperacao', '0%')}")
+
+    ciclos = sbj.get("ciclos_teimosinha", [])
+    if ciclos:
+        print(f"\n  Teimosinha:")
+        for c in ciclos:
+            print(f"    · Protocolo {c['protocolo']}: "
+                  f"{c['total_reiteracoes']} reiterações, "
+                  f"R$ {c['valor_total_bloqueado']:,.2f} bloqueado")
+
+    # Resumo MLE
+    mle = resultado.get("mle", {})
+    print(f"\n  MLEs:")
+    print(f"    · Formulários encontrados: {mle.get('total_mles', 0)}")
+    print(f"    · Erros detectados: {mle.get('total_erros', 0)}")
+    print(f"    · Erros críticos: {mle.get('erros_criticos', 0)}")
+
+    for erro in mle.get("erros", []):
+        print(f"    · [{erro.get('gravidade', '')}] {erro.get('tipo', '')}: "
+              f"{erro.get('descricao', '')[:80]}")
+
+    # Valores pendentes
+    pend = resultado.get("valores_pendentes", {})
+    print(f"\n  Valores pendentes:")
+    print(f"    · Chaves com saldo pendente: {pend.get('total_chaves_pendentes', 0)}")
+    print(f"    · Valor total pendente: R$ {pend.get('valor_total_pendente', 0):,.2f}")
+
+    # Salvar
+    caminho_json = Path(diretorio_saida) / "mapeamento_movimentos.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
+def executar_segmentacao(diretorio_saida):
+    """Executa segmentação de peças processuais com identificação de autoria."""
+    from src.segmentador_pecas import SegmentadorPecas
+
+    textos = encontrar_textos(diretorio_saida)
+
+    if not textos:
+        print("  ERRO: Nenhum arquivo de texto extraído encontrado.")
+        print("  Execute primeiro: python main.py --todos --output output/")
+        return None
+
+    print(f"\n{'='*60}")
+    print("  SEGMENTAÇÃO DE PEÇAS PROCESSUAIS")
+    print(f"{'='*60}")
+    print(f"\n  Textos de entrada: {len(textos)}")
+    for t in textos:
+        print(f"    · {Path(t).name}")
+
+    segmentador = SegmentadorPecas(textos)
+    resultado = segmentador.executar()
+
+    # Resumo consolidado
+    total_pecas = sum(
+        p["total_pecas"] for p in resultado["processos"].values()
+    )
+    print(f"\n  Total consolidado: {total_pecas} peças em {len(textos)} arquivo(s)")
+
+    # Salvar
+    # Remover conteúdo completo das peças para o JSON (muito grande)
+    resultado_json = json.loads(json.dumps(resultado, default=str))
+    for proc_data in resultado_json["processos"].values():
+        for peca in proc_data.get("pecas", []):
+            peca.pop("conteudo", None)
+
+    caminho_json = Path(diretorio_saida) / "segmentacao_pecas.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado_json, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
+def executar_auditoria(diretorio_saida, mapeamento=None):
+    """Executa auditoria processual de falhas e inconsistências."""
+    from src.auditoria_processual import AuditoriaProcessual
+
+    textos = encontrar_textos(diretorio_saida)
+    dir_saida = Path(diretorio_saida)
+
+    # Carregar mapeamento se não fornecido
+    if mapeamento is None:
+        caminho_map = dir_saida / "mapeamento_movimentos.json"
+        if not caminho_map.exists():
+            print("  ERRO: mapeamento_movimentos.json não encontrado.")
+            print("  Execute primeiro: python main.py --mapeamento --output output/")
+            return None
+        with open(caminho_map, "r", encoding="utf-8") as f:
+            mapeamento = json.load(f)
+
+    # Carregar cruzamento e onerosidade se existirem
+    cruzamento = None
+    caminho_cruz = dir_saida / "cruzamento_forense.json"
+    if caminho_cruz.exists():
+        with open(caminho_cruz, "r", encoding="utf-8") as f:
+            cruzamento = json.load(f)
+
+    onerosidade = None
+    caminho_oner = dir_saida / "onerosidade.json"
+    if caminho_oner.exists():
+        with open(caminho_oner, "r", encoding="utf-8") as f:
+            onerosidade = json.load(f)
+
+    print(f"\n{'='*60}")
+    print("  AUDITORIA PROCESSUAL")
+    print(f"{'='*60}")
+
+    auditoria = AuditoriaProcessual(
+        mapeamento, cruzamento, onerosidade, textos,
+    )
+    resultado = auditoria.executar()
+
+    # Resumo
+    resumo = resultado.get("resumo", {})
+    print(f"\n  Score de conformidade: {resumo.get('score_conformidade', 0)}/100 "
+          f"({resumo.get('classificacao', '')})")
+    print(f"  Total de achados: {resumo.get('total_achados', 0)}")
+
+    por_grav = resumo.get("por_gravidade", {})
+    for grav in ["CRITICO", "ALTO", "MEDIO", "BAIXO", "INFO"]:
+        qtd = por_grav.get(grav, 0)
+        if qtd > 0:
+            print(f"    · {grav}: {qtd}")
+
+    print(f"\n  Achados detalhados:")
+    for achado in resultado.get("achados", []):
+        regra = achado.get("regra", {})
+        print(f"    [{regra.get('gravidade', '?')}] {regra.get('codigo', '?')}: "
+              f"{achado.get('evidencia', '')[:100]}")
+
+    # Salvar
+    caminho_json = dir_saida / "auditoria_processual.json"
+    with open(caminho_json, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    print(f"\n  Salvo em: {caminho_json}")
+
+    return resultado
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analisador de Documentos Jurídicos",
@@ -361,6 +551,9 @@ Exemplos:
   python main.py --cruzamento --output output/
   python main.py --onerosidade --output output/
   python main.py --relatorio --output output/
+  python main.py --mapeamento --output output/
+  python main.py --auditoria --output output/
+  python main.py --segmentar --output output/
   python main.py --forense --output output/
         """,
     )
@@ -395,14 +588,31 @@ Exemplos:
         help="Gerar relatório DOCX consolidado",
     )
     parser.add_argument(
+        "--mapeamento",
+        action="store_true",
+        help="Mapeamento granular de movimentos (SISBAJud, MLE, protocolos)",
+    )
+    parser.add_argument(
+        "--auditoria",
+        action="store_true",
+        help="Auditoria de falhas e inconsistências processuais",
+    )
+    parser.add_argument(
+        "--segmentar",
+        action="store_true",
+        help="Segmentação de peças processuais com identificação de autoria",
+    )
+    parser.add_argument(
         "--forense",
         action="store_true",
-        help="Executar pipeline forense completo (cruzamento + onerosidade + relatório)",
+        help="Pipeline forense completo (segmentação + cruzamento + onerosidade + mapeamento + auditoria + relatório)",
     )
 
     args = parser.parse_args()
 
-    modo_forense = args.cruzamento or args.onerosidade or args.relatorio or args.forense
+    modo_forense = (args.cruzamento or args.onerosidade or args.relatorio
+                    or args.mapeamento or args.auditoria or args.segmentar
+                    or args.forense)
     modo_extracao = args.arquivo or args.todos
 
     if not modo_forense and not modo_extracao:
@@ -432,19 +642,32 @@ Exemplos:
 
     # Fase 2: Análise forense
     if args.forense:
+        executar_segmentacao(args.output)
         cruzamento = executar_cruzamento(args.output)
         onerosidade = executar_onerosidade(args.output)
+        mapeamento = executar_mapeamento(args.output)
+        auditoria_result = executar_auditoria(args.output, mapeamento)
         if cruzamento and onerosidade:
             executar_relatorio(args.output, cruzamento, onerosidade)
     else:
         cruzamento = None
         onerosidade = None
+        mapeamento = None
+
+        if args.segmentar:
+            executar_segmentacao(args.output)
 
         if args.cruzamento:
             cruzamento = executar_cruzamento(args.output)
 
         if args.onerosidade:
             onerosidade = executar_onerosidade(args.output)
+
+        if args.mapeamento:
+            mapeamento = executar_mapeamento(args.output)
+
+        if args.auditoria:
+            executar_auditoria(args.output, mapeamento)
 
         if args.relatorio:
             executar_relatorio(args.output, cruzamento, onerosidade)
